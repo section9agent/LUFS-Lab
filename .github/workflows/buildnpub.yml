@@ -1,7 +1,7 @@
 # Builds LUFS Lab for Windows, macOS (Apple Silicon + Intel) and Linux on GitHub's servers,
 # so you do not need each kind of computer. Put this folder in a GitHub repository, then:
 #   Actions tab > "Build LUFS Lab" > Run workflow  -> download the files from the finished run.
-name: Build LUFS Lab
+name: Build & Publish LUFS Lab
 on:
   workflow_dispatch:
   push:
