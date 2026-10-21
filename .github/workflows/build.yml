@@ -7,6 +7,10 @@ on:
   push:
     tags: ["v*"]
 
+# Grant permissions needed to create a GitHub Release
+permissions:
+  contents: write
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -42,3 +46,33 @@ jobs:
       - run: chmod +x *.sh && ./build_linux.sh
       - uses: actions/upload-artifact@v4
         with: { name: LUFS-Lab-linux, path: "dist/LUFS-Lab-*.AppImage" }
+
+  release:
+    name: Publish GitHub Release
+    needs: [windows, macos, linux] # Wait for all builds to finish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Downloads all files uploaded via actions/upload-artifact
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      # Flattens the downloaded directory structure for the release upload
+      - name: Prepare assets for release
+        run: |
+          mkdir -p final-assets
+          find release-artifacts -type f -exec cp {} final-assets/ \;
+          ls -l final-assets/
+
+      # Creates the release and attaches the assets
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || 'manual-build' }}
+          name: "Release ${{ github.ref_name || 'Manual Build' }}"
+          draft: false
+          prerelease: false
+          files: final-assets/*
