@@ -1,5 +1,4 @@
 # LUFS-Lab
-========
 Brings audio files to a target loudness (LUFS) with a true-peak limiter.
 Built for music at -14 LUFS, with a voice/vocals mode, a batch "match" mode,
 and WAV / FLAC / MP3 output. Runs on Windows, macOS and Linux.
