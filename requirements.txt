@@ -1,0 +1,5 @@
+numpy
+scipy
+soundfile>=0.12.1
+tkinterdnd2
+lameenc
