@@ -1,15 +1,14 @@
-# Builds LUFS Lab for Windows, macOS (Apple Silicon + Intel) and Linux on GitHub's servers,
-# so you do not need each kind of computer. Put this folder in a GitHub repository, then:
-#   Actions tab > "Build LUFS Lab" > Run workflow  -> download the files from the finished run.
+# Builds LUFS Lab for Windows, macOS (Apple Silicon + Intel) and Linux on GitHub's servers.
+#   Manual test build : Actions tab > "Build LUFS Lab" > Run workflow (files appear on the run).
+#   Real release      : git tag v1.0.1 && git push origin v1.0.1
+#                       -> builds everything, stamps the version, and creates a DRAFT release.
+#                       Open the draft on GitHub and press "Publish release"; only published
+#                       releases are seen by the in-app updater.
 name: Build LUFS Lab
 on:
   workflow_dispatch:
   push:
     tags: ["v*"]
-
-# Grant permissions needed to create a GitHub Release
-permissions:
-  contents: write
 
 jobs:
   windows:
@@ -18,6 +17,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
+      - run: python stamp_version.py
+        shell: cmd
       - run: .\build_exe.bat
         shell: cmd
       - uses: actions/upload-artifact@v4
@@ -34,6 +35,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
+      - run: python3 stamp_version.py
       - run: chmod +x *.sh && ./build_mac.sh
       - uses: actions/upload-artifact@v4
         with: { name: "LUFS-Lab-mac-${{ matrix.name }}", path: "dist/LUFS-Lab-mac-*.zip" }
@@ -43,36 +45,42 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y python3-tk python3-venv
+      - run: python3 stamp_version.py
       - run: chmod +x *.sh && ./build_linux.sh
       - uses: actions/upload-artifact@v4
         with: { name: LUFS-Lab-linux, path: "dist/LUFS-Lab-*.AppImage" }
 
-  release:
-    name: Publish GitHub Release
-    needs: [windows, macos, linux] # Wait for all builds to finish
-    runs-on: ubuntu-latest
+  source:
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-
-      # Downloads all files uploaded via actions/upload-artifact
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: release-artifacts
-
-      # Flattens the downloaded directory structure for the release upload
-      - name: Prepare assets for release
+      - run: python3 stamp_version.py
+      - name: Zip the source (used by the updater for "run from source" installs)
         run: |
-          mkdir -p final-assets
-          find release-artifacts -type f -exec cp {} final-assets/ \;
-          ls -l final-assets/
+          mkdir -p out/LUFS-Lab
+          cp *.py *.txt *.sh *.bat *.command icon.* out/LUFS-Lab/
+          chmod +x out/LUFS-Lab/*.sh out/LUFS-Lab/*.command
+          (cd out && zip -r ../LUFS-Lab-source.zip LUFS-Lab)
+      - uses: actions/upload-artifact@v4
+        with: { name: LUFS-Lab-source, path: LUFS-Lab-source.zip }
 
-      # Creates the release and attaches the assets
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos, linux, source]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts, merge-multiple: true }
+      - name: Checksums
+        run: |
+          cd artifacts
+          ls -l
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || 'manual-build' }}
-          name: "Release ${{ github.ref_name || 'Manual Build' }}"
-          draft: false
-          prerelease: false
-          files: final-assets/*
+          draft: true
+          generate_release_notes: true
+          files: artifacts/*

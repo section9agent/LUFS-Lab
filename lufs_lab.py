@@ -29,11 +29,15 @@ import tempfile
 import threading
 import time
 import traceback
+import webbrowser
 
 import numpy as np
 import soundfile as sf
 from scipy import signal
 from scipy.ndimage import minimum_filter1d, uniform_filter1d
+
+import lufs_about
+import lufs_updater as upd
 
 APP_NAME = "LUFS Lab"
 SUPPORTED_EXT = (".wav", ".flac", ".mp3", ".ogg", ".oga", ".aif", ".aiff")
@@ -733,9 +737,40 @@ def open_folder(path):
 # --------------------------------------------------------------------------- #
 #  Command line
 # --------------------------------------------------------------------------- #
+def cli_update(install):
+    """--check-update / --update: no window needed."""
+    try:
+        info = upd.check_latest()
+    except upd.UpdateError as exc:
+        print(f"Update check failed: {exc}")
+        return 1
+    if not info["newer"]:
+        print(f"You have the latest version ({upd.APP_VERSION}).")
+        return 0
+    print(f"Version {info['version']} is available (you have {upd.APP_VERSION}): {info['page']}")
+    if not install:
+        print("Run again with --update to install it.")
+        return 0
+    shown = [-1]
+
+    def progress(f):
+        step = int(f * 10)
+        if step != shown[0]:
+            shown[0] = step
+            print(f"  downloading... {step * 10}%")
+
+    try:
+        upd.apply_update(info, progress=progress)
+    except upd.UpdateError as exc:
+        print(f"Update failed: {exc}")
+        return 1
+    print(f"Updated to {info['version']}. Start {APP_NAME} again to use it.")
+    return 0
+
+
 def cli(argv):
     ap = argparse.ArgumentParser(description="Level audio files to a target LUFS with a true-peak limiter.")
-    ap.add_argument("inputs", nargs="+", help="audio files and/or folders")
+    ap.add_argument("inputs", nargs="*", help="audio files and/or folders")
     ap.add_argument("-t", "--target", type=float, default=-14.0, help="target LUFS (default -14)")
     ap.add_argument("--match", action="store_true",
                     help="match all files to each other at the batch's average loudness (ignores --target)")
@@ -748,7 +783,18 @@ def cli(argv):
                     help="save into this folder (default: a \"leveled\" folder inside each source folder)")
     ap.add_argument("--beside", action="store_true",
                     help="save next to each original with _leveled added to the name")
+    ap.add_argument("--version", action="store_true", help="show the version and exit")
+    ap.add_argument("--check-update", action="store_true", help="check GitHub for a newer version and exit")
+    ap.add_argument("--update", action="store_true", help="download and install the newest version, then exit")
     args = ap.parse_args(argv)
+
+    if args.version:
+        print(f"{APP_NAME} {upd.APP_VERSION}")
+        return 0
+    if args.check_update or args.update:
+        return cli_update(install=args.update)
+    if not args.inputs:
+        ap.error("give at least one audio file or folder (or use --version / --check-update / --update)")
 
     files = collect_audio_files(args.inputs)
     if not files:
@@ -769,6 +815,7 @@ def cli(argv):
 def gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
+    from tkinter import font as tkfont
 
     try:                                    # crisp text on high-DPI Windows screens
         import ctypes
@@ -813,6 +860,12 @@ def gui():
             self.q: queue.Queue = queue.Queue()
             self.cancel_flag = threading.Event()
             self.worker = None
+            upd.cleanup_old_files()
+            self.settings = upd.load_settings()
+            self.auto_update = tk.BooleanVar(value=bool(self.settings["auto_update"]))
+            self.auto_update.trace_add("write", lambda *a: self._save_auto_update())
+            self.updating = False
+            self._about = None
 
             self.mode = tk.StringVar(value="music")
             self.target = tk.StringVar(value="-14")
@@ -921,7 +974,191 @@ def gui():
                     root.after(400, lambda: root.attributes("-topmost", False))
                 except Exception:
                     pass
-            root.after(100, self._poll)
+            self._build_menu()
+            self._poll_id = root.after(100, self._poll)
+            self._startup_id = None
+            if upd.auto_check_due(self.settings):
+                self._startup_id = root.after(2500, lambda: self._check_updates(manual=False))
+            root.protocol("WM_DELETE_WINDOW", self._quit)
+
+        def _quit(self):
+            """Close the window without leaving timers behind."""
+            for attr in ("_poll_id", "_startup_id"):
+                try:
+                    self.root.after_cancel(getattr(self, attr))
+                except Exception:
+                    pass
+            self.root.destroy()
+
+        # ---- menu, About window, updates ----
+        def _build_menu(self):
+            menubar = tk.Menu(self.root, tearoff=0)
+            helpmenu = tk.Menu(menubar, tearoff=0)
+            helpmenu.add_command(label="Check for updates...", command=lambda: self._check_updates(manual=True))
+            helpmenu.add_checkbutton(label="Check for updates automatically", variable=self.auto_update)
+            helpmenu.add_separator()
+            helpmenu.add_command(label="Donate (PayPal)...", command=lambda: webbrowser.open(lufs_about.DONATE_URL))
+            helpmenu.add_command(label=f"About {APP_NAME}", command=self.show_about)
+            menubar.add_cascade(label="Help", menu=helpmenu)
+            self.root.config(menu=menubar)
+            self.menubar, self.helpmenu = menubar, helpmenu
+            if sys.platform == "darwin":            # also answer the standard "About" item in the app menu
+                try:
+                    self.root.createcommand("tkAboutDialog", self.show_about)
+                except Exception:
+                    pass
+
+        def _save_auto_update(self):
+            self.settings["auto_update"] = bool(self.auto_update.get())
+            if not upd.save_settings(self.settings):
+                self._log("Could not save the update setting (the settings folder is not writable).")
+
+        def show_about(self):
+            try:
+                if self._about is not None and self._about.winfo_exists():
+                    self._about.lift()
+                    return
+            except Exception:
+                pass
+            self._about = lufs_about.show_about(self.root, upd.APP_VERSION, self.auto_update,
+                                                lambda: self._check_updates(manual=True),
+                                                icon_images=self._icons)
+
+        def _idle(self):
+            return not self.updating and not (self.worker is not None and self.worker.is_alive())
+
+        def _say(self, text):
+            """Change the status line, but never over the progress text of a running batch."""
+            if self._idle():
+                self.status.config(text=text)
+
+        def _check_updates(self, manual):
+            if self.updating:
+                return
+            if manual:
+                self._say("Checking for updates...")
+            threading.Thread(target=self._check_worker, args=(manual,), daemon=True).start()
+
+        def _check_worker(self, manual):
+            try:
+                self.q.put(("update_info", (upd.check_latest(), manual)))
+            except upd.UpdateError as exc:
+                self.q.put(("update_error", (str(exc), manual)))
+            except Exception as exc:                # a background check must never crash the program
+                self.q.put(("update_error", (f"Unexpected problem: {exc}", manual)))
+
+        def _on_update_error(self, msg, manual):
+            if manual:
+                self._say("Update check failed.")
+                messagebox.showerror(APP_NAME, f"Could not check for updates.\n\n{msg}")
+
+        def _on_update_info(self, info, manual):
+            self.settings["last_check"] = time.time()
+            upd.save_settings(self.settings)
+            if not info["newer"]:
+                if manual:
+                    self._say("You have the latest version.")
+                    messagebox.showinfo(APP_NAME, f"You have the latest version ({upd.APP_VERSION}).")
+                return
+            if not manual and info["version"] == self.settings.get("skipped_version"):
+                return
+            if self.worker is not None and self.worker.is_alive():
+                self._log(f"Version {info['version']} is available - use Help > Check for updates "
+                          "when this batch has finished.")
+                return
+            self._say(f"Version {info['version']} is available.")
+            self._update_dialog(info)
+
+        def _update_dialog(self, info):
+            manual_only = upd.install_kind() == "manual"
+            win = tk.Toplevel(self.root)
+            win.title("Update available")
+            win.transient(self.root)
+            win.geometry("540x430")
+            head = tkfont.nametofont("TkDefaultFont").copy()
+            head.configure(size=int(abs(head.cget("size")) * 1.4), weight="bold")
+            win._font = head
+            ttk.Label(win, text=f"{APP_NAME} {info['version']} is available", font=head).pack(
+                anchor="w", padx=16, pady=(14, 0))
+            ttk.Label(win, text=f"You have version {upd.APP_VERSION}.", foreground="#555555").pack(
+                anchor="w", padx=16, pady=(0, 8))
+            ttk.Label(win, text="What's new:").pack(anchor="w", padx=16)
+            box = ttk.Frame(win)
+            box.pack(fill="both", expand=True, padx=16, pady=(2, 8))
+            notes = tk.Text(box, wrap="word", height=10)
+            nsb = ttk.Scrollbar(box, orient="vertical", command=notes.yview)
+            notes.config(yscrollcommand=nsb.set)
+            notes.pack(side="left", fill="both", expand=True)
+            nsb.pack(side="left", fill="y")
+            notes.insert("end", (info["notes"] or "No release notes were provided.")[:4000])
+            notes.config(state="disabled")
+            if manual_only:
+                ttk.Label(win, text="This copy cannot replace itself, so the download page will open instead.",
+                          foreground="#555555", wraplength=500).pack(anchor="w", padx=16)
+            row = ttk.Frame(win)
+            row.pack(fill="x", padx=16, pady=(8, 14))
+
+            def install():
+                win.destroy()
+                if manual_only:
+                    webbrowser.open(info["page"])
+                else:
+                    self._start_install(info)
+
+            def skip():
+                self.settings["skipped_version"] = info["version"]
+                upd.save_settings(self.settings)
+                win.destroy()
+
+            ttk.Button(row, text="Open download page" if manual_only else "Install and restart",
+                       command=install).pack(side="left")
+            ttk.Button(row, text="Remind me later", command=win.destroy).pack(side="left", padx=8)
+            ttk.Button(row, text="Skip this version", command=skip).pack(side="left")
+            self._update_win = win
+
+            def grab():
+                try:
+                    win.grab_set()
+                    win.focus_set()
+                except Exception:
+                    pass
+            win.after(150, grab)
+
+        def _start_install(self, info):
+            if self.worker is not None and self.worker.is_alive():
+                messagebox.showwarning(APP_NAME, "Please wait until the current batch has finished, then update.")
+                return
+            self.updating = True
+            self.start_btn.config(state="disabled")
+            self.file_bar["value"] = 0
+            self.status.config(text=f"Downloading version {info['version']}...")
+            threading.Thread(target=self._install_worker, args=(info,), daemon=True).start()
+
+        def _install_worker(self, info):
+            try:
+                argv = upd.apply_update(info, progress=lambda f: self.q.put(("file", f)))
+                self.q.put(("update_installed", argv))
+            except upd.UpdateError as exc:
+                self.q.put(("update_failed", (str(exc), info)))
+            except Exception as exc:
+                self.q.put(("update_failed", (f"Unexpected problem: {exc}", info)))
+
+        def _on_update_installed(self, argv):
+            self.status.config(text="Update installed - restarting...")
+            try:
+                upd.restart_app(argv)
+            except OSError:
+                messagebox.showinfo(APP_NAME, "The update was installed. Please start LUFS Lab again.")
+            self.root.after(200, self._quit)
+
+        def _on_update_failed(self, msg, info):
+            self.updating = False
+            self.start_btn.config(state="normal")
+            self.file_bar["value"] = 0
+            self.status.config(text="Update failed.")
+            if messagebox.askyesno(APP_NAME, f"The update could not be installed.\n\n{msg}\n\n"
+                                             "Open the download page instead?", icon="warning"):
+                webbrowser.open(info["page"])
 
         # ---- drag and drop ----
         def _enable_dnd(self):
@@ -1018,9 +1255,17 @@ def gui():
                         self.all_bar["value"] = val
                     elif kind == "done":
                         self._finish(val)
+                    elif kind == "update_info":
+                        self._on_update_info(*val)
+                    elif kind == "update_error":
+                        self._on_update_error(*val)
+                    elif kind == "update_installed":
+                        self._on_update_installed(val)
+                    elif kind == "update_failed":
+                        self._on_update_failed(*val)
             except queue.Empty:
                 pass
-            self.root.after(100, self._poll)
+            self._poll_id = self.root.after(100, self._poll)
 
         def _finish(self, res):
             self.start_btn.config(state="normal")
@@ -1046,6 +1291,9 @@ def gui():
 
         # ---- run ----
         def start(self):
+            if self.updating:
+                messagebox.showinfo(APP_NAME, "An update is being installed - please wait a moment.")
+                return
             if not self.files:
                 messagebox.showwarning(APP_NAME, "Add at least one audio file first.")
                 return
